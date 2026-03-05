@@ -1,122 +1,80 @@
 module("luci.controller.scutclient", package.seeall)
 
-http = require "luci.http"
-fs = require "nixio.fs"
-sys  = require "luci.sys"
-
-log_file = "/tmp/scutclient.log"
-log_file_backup = "/tmp/scutclient.log.backup.log"
-
 function index()
-	if not fs.access("/etc/config/scutclient") then
-		return
-	end
-	local uci = require "luci.model.uci".cursor()
-	local mainorder = uci:get_first("scutclient", "luci", "mainorder", 10)
-
-	entry({"admin", "services", "scutclient"},
-		alias("admin", "services", "scutclient", "settings"),
-		"华南理工大学客户端",
-		mainorder
-	)
-
-	entry({"admin", "services", "scutclient", "settings"},
-		cbi("scutclient/scutclient"),
-		"设置",
-		10
-	).leaf = true
-
-	entry({"admin", "services", "scutclient", "status"},
-		call("action_status"),
-		"状态",
-		20
-	).leaf = true
-
-	entry({"admin", "services", "scutclient", "logs"}, template("scutclient/logs"), "日志", 30).leaf = true
-	entry({"admin", "services", "scutclient", "about"}, call("action_about"), "关于", 40).leaf = true
-	entry({"admin", "services", "scutclient", "get_log"}, call("get_log"))
-	entry({"admin", "services", "scutclient", "netstat"}, call("get_netstat"))
-	entry({"admin", "services", "scutclient", "scutclient-log.tar"}, call("get_dbgtar"))
+    entry({"admin", "services", "scutclient"}, alias("admin", "services", "scutclient", "settings"), _("SCUTClient"), 10).dependent = true
+    
+    entry({"admin", "services", "scutclient", "settings"}, cbi("scutclient/scutclient"), _("设置"), 10).leaf = true
+    -- 状态页面：交由 action_status 处理逻辑并渲染模板
+    entry({"admin", "services", "scutclient", "status"}, call("action_status"), _("状态"), 20).leaf = true
+    entry({"admin", "services", "scutclient", "logs"}, template("scutclient/logs"), _("日志"), 30).leaf = true
+    -- About 页面
+    entry({"admin", "services", "scutclient", "about"}, template("scutclient/about"), _("关于"), 40).leaf = true
+    -- API 接口（不显示在菜单上）
+    entry({"admin", "services", "scutclient", "netstat"}, call("get_netstat")).leaf = true
+    entry({"admin", "services", "scutclient", "get_log"}, call("get_log")).leaf = true
+    entry({"admin", "services", "scutclient", "scutclient-log.tar"}, call("get_dbgtar")).leaf = true
 end
-
-
-function get_log()
-	local send_log_lines = 75
-	if fs.access(log_file) then
-		client_log = sys.exec("tail -n "..send_log_lines.." " .. log_file)
-	else
-		client_log = "Unable to access the log file!"
-	end
-
-	http.prepare_content("text/plain; charset=gbk")
-	http.write(client_log)
-	http.close()
-end
-
-function action_about()
-	luci.template.render("scutclient/about")
-end
-
 
 function action_status()
-	luci.template.render("scutclient/status")
-	if luci.http.formvalue("logoff") == "1" then
-		luci.sys.call("/etc/init.d/scutclient stop > /dev/null")
-	end
-	if luci.http.formvalue("redial") == "1" then
-		luci.sys.call("/etc/init.d/scutclient stop > /dev/null")
-		luci.sys.call("/etc/init.d/scutclient start > /dev/null")
-	end
-	if luci.http.formvalue("move_tag") == "1" then
-		luci.sys.call("uci set scutclient.@luci[-1].mainorder=90")
-		luci.sys.call("uci commit")
-		luci.sys.call("rm -rf /tmp/luci-*cache")
-	end
+    local sys = require "luci.sys"
+    local http = require "luci.http"
+    
+    -- 处理网页前端传来的“重拨”和“下线”动作
+    if http.formvalue("logoff") == "1" then
+        sys.call("/etc/init.d/scutclient stop > /dev/null 2>&1")
+    elseif http.formvalue("redial") == "1" then
+        sys.call("/etc/init.d/scutclient restart > /dev/null 2>&1")
+    end
+    
+    -- 处理完动作后，渲染状态页面
+    luci.template.render("scutclient/status")
 end
 
 function get_netstat()
-	local hcontent = sys.exec("wget -O- http://whatismyip.akamai.com 2>/dev/null | head -n1")
-	local nstat = {}
-	if hcontent == '' then
-		nstat.stat = 'no_internet'
-	elseif hcontent:find("(%d+)%.(%d+)%.(%d+)%.(%d+)") then
-		nstat.stat = 'internet'
-	else
-		nstat.stat = 'no_login'
-	end
-	http.prepare_content("application/json")
-	http.write_json(nstat)
-	http.close()
+    local sys = require "luci.sys"
+    local http = require "luci.http"
+    local hcontent = sys.exec("wget -qO- http://whatismyip.akamai.com 2>/dev/null | head -n1")
+    local nstat = { stat = 'no_login' }
+    
+    if hcontent and hcontent:find("(%d+)%.(%d+)%.(%d+)%.(%d+)") then
+        nstat.stat = 'internet'
+    elseif hcontent == '' then
+        nstat.stat = 'no_internet'
+    end
+    
+    http.prepare_content("application/json")
+    http.write_json(nstat)
+end
+
+function get_log()
+    local fs = require "nixio.fs"
+    local http = require "luci.http"
+    local log = fs.readfile("/tmp/scutclient.log") or "还没有日志记录"
+    http.prepare_content("text/plain")
+    http.write(log)
 end
 
 function get_dbgtar()
+    local sys = require "luci.sys"
+    local fs = require "nixio.fs"
+    local http = require "luci.http"
 
-	local tar_dir = "/tmp/scutclient-log"
-	local tar_files = {
-		"/etc/config/wireless",
-		"/etc/config/network",
-		"/etc/config/system",
-		"/etc/config/scutclient",
-		"/etc/openwrt_release",
-		"/etc/crontabs/root",
-		"/etc/config/dhcp",
-		"/tmp/dhcp.leases",
-		"/etc/rc.local",
-	}
+    local tar_dir = "/tmp/scutclient-log"
+    local tar_files = {
+        "/etc/config/network",
+        "/etc/config/scutclient",
+        "/tmp/dhcp.leases"
+    }
 
-	fs.mkdirr(tar_dir)
-	table.foreach(tar_files, function(i, v)
-			luci.sys.call("cp " .. v .. " " .. tar_dir)
-	end)
+    fs.mkdirr(tar_dir)
+    -- 修复：现代 Lua 已弃用 table.foreach，改用标准的 ipairs
+    for _, v in ipairs(tar_files) do
+        sys.call("cp " .. v .. " " .. tar_dir .. " 2>/dev/null")
+    end
+    sys.call("cat /tmp/scutclient.log* >> " .. tar_dir .. "/scutclient.log 2>/dev/null")
 
-	if fs.access(log_file_backup) then
-		luci.sys.call("cat " .. log_file_backup .. " >> " .. tar_dir .. "/scutclient.log")
-	end
-	if fs.access(log_file) then
-		luci.sys.call("cat " .. log_file .. " >> " .. tar_dir .. "/scutclient.log")
-	end
-	http.prepare_content("application/octet-stream")
-	http.write(sys.exec("tar -C " .. tar_dir .. " -cf - ."))
-	luci.sys.call("rm -rf " .. tar_dir)
-	http.close()
+    http.header("Content-Disposition", "attachment; filename=\"scutclient-log.tar\"")
+    http.prepare_content("application/octet-stream")
+    http.write(sys.exec("tar -C " .. tar_dir .. " -cf - ."))
+    sys.call("rm -rf " .. tar_dir)
 end
